@@ -1,0 +1,38 @@
+[package]
+name = "afterautism"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.85"
+authors = ["AutismDisorder"]
+description = "Embedded access to data: a typed, versioned, queryable corpus with one deterministic query language over text, fields, and graph"
+license = "AGPL-3.0-or-later"
+readme = "README.md"
+repository = "https://github.com/AutismDisorder/AfterAutism"
+homepage = "https://github.com/AutismDisorder/AfterAutism"
+keywords = ["engine", "data-management", "graph", "storage", "search"]
+categories = ["data-structures", "database", "rust-patterns"]
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "2.0"
+rusqlite = { version = "0.40.1", features = ["bundled", "backup", "vtab"] }
+zstd = "0.13.3"
+rayon = "1.12.0"
+regex = "1.11"
+
+[dev-dependencies]
+serde_json = "1.0"
+tempfile = "3.27"
+criterion = "0.5"
+
+[[bench]]
+name = "storage"
+harness = false
+
+[[bench]]
+name = "query"
+harness = false
+
+[[bench]]
+name = "topology"
+harness = false
