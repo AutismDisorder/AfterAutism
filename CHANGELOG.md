@@ -30,9 +30,10 @@ versioned, migratable storage).
 
 **Measured**
 
-- 50k-contract corpus: point reads ~7 µs, page ~49 µs, full-text ~15 ms,
-  typed-field queries ~44–51 ms, 506 B/contract index+metadata,
-  908 B/contract with compressed document bodies (2016 laptop; see
-  `BENCHMARKS.md`).
+- 50k-contract corpus: point reads ~8 µs, page ~57 µs, full-text ~13 ms,
+  typed-field queries ~44–66 ms, 506 B/contract index+metadata,
+  908 B/contract with compressed document bodies. Access paths are
+  cache-bound and identical on a real HDD; commit/checkpoint is 2.7x
+  slower on the HDD (full environment and caveats in `BENCHMARKS.md`).
 
 **License**: AGPL-3.0-or-later.
