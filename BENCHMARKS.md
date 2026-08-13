@@ -160,7 +160,6 @@ Interpretation:
   buffered WAL design absorbs; the remaining 2.7x is the honest price
   of durability on this disk.
 
-
 ## Rerun
 
 ```sh

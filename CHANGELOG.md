@@ -2,6 +2,26 @@
 
 All notable changes to the `afterautism` engine.
 
+## 0.0.2 — safe multi-process access
+
+- Every connection now waits up to 5 s for a momentarily held lock
+  instead of failing instantly with `SQLITE_BUSY`.
+- All write transactions (`write_batch`, schema init, migrations) now
+  begin `IMMEDIATE`: the write lock is taken at `BEGIN`, before any
+  WAL read snapshot exists. Without this, a deferred transaction
+  upgrading against a stale snapshot fails with `SQLITE_BUSY_SNAPSHOT`
+  the moment the other writer commits — a failure the busy wait cannot
+  retry.
+- Lock contention that outlasts the wait is now typed: `SQLITE_BUSY` /
+  `SQLITE_LOCKED` surface as [`CorpusError::Locked`] (previously a
+  generic sqlite error), so callers can retry the whole operation.
+- The multi-process model is documented on the `storage` module: WAL
+  readers run concurrently, writes serialize, commits are atomic
+  renames.
+- Tests pin all three: the busy wait is set on every connection, a
+  contender writer waits out a held lock and commits, and contention
+  classifies as `Locked`.
+
 ## 0.0.1 — initial release
 
 The first release of the engine: access to data — any filetype in (via

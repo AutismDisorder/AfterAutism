@@ -92,12 +92,30 @@ pub enum StorageError {
     Corpus(#[from] CorpusError),
 
     /// `SQLite` error from rusqlite (direct conversion).
+    /// Lock contention is classified: `SQLITE_BUSY`/`SQLITE_LOCKED`
+    /// convert to [`CorpusError::Locked`] (see the `From` impl), so a
+    /// caller sees the retryable contention kind instead of a generic
+    /// sqlite error.
     #[error(transparent)]
-    Sqlite(#[from] rusqlite::Error),
+    Sqlite(rusqlite::Error),
 
     /// I/O error (convenience for direct I/O operations).
     #[error(transparent)]
     Io(#[from] std::io::Error),
+}
+
+impl From<rusqlite::Error> for StorageError {
+    fn from(e: rusqlite::Error) -> Self {
+        if let rusqlite::Error::SqliteFailure(ref failure, _) = e {
+            match failure.code {
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked => {
+                    return StorageError::Corpus(CorpusError::Locked(e.to_string()));
+                }
+                _ => {}
+            }
+        }
+        StorageError::Sqlite(e)
+    }
 }
 
 pub type Result<T> = std::result::Result<T, StorageError>;

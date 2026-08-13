@@ -47,6 +47,11 @@ const CORPUS_APPLICATION_ID: i32 = 0x4154_4152; // b"ATAR" */
 /// Open a connection to the corpus database, creating schema if needed.
 fn open_corpus(path: &Path) -> Result<Connection> {
     let mut conn = Connection::open(path)?;
+    // Bounded wait for momentary lock contention (another process
+    // mid-transaction). WAL readers never wait; this only delays
+    // writers until the current writer finishes. Sustained contention
+    // still fails after the wait, as [`CorpusError::Locked`].
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
     conn.execute_batch(
         "PRAGMA journal_mode = WAL;
          PRAGMA synchronous = NORMAL;
@@ -96,7 +101,11 @@ fn open_corpus(path: &Path) -> Result<Connection> {
 /// imperative logic, so the length is inherent.
 #[allow(clippy::too_many_lines)]
 fn init_schema(conn: &mut Connection) -> Result<()> {
-    let tx = conn.transaction()?;
+    // IMMEDIATE (not deferred): a write transaction must take the
+    // write lock at BEGIN, before any WAL read snapshot exists — a
+    // deferred upgrade against a stale snapshot fails with
+    // SQLITE_BUSY_SNAPSHOT, which the busy wait cannot retry.
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
     // Nodes table: stores node metadata
     tx.execute(
@@ -268,7 +277,13 @@ impl Corpus {
     /// fields are written in the same transaction: each node's field set
     /// is replaced (DELETE + re-INSERT), so idempotent refreshes converge.
     pub fn write_batch(&mut self, batch: &IngestBatch, adapter_id: &str) -> Result<()> {
-        let tx = self.conn.transaction()?;
+        // IMMEDIATE (not deferred): a write transaction must take the
+        // write lock at BEGIN, before any WAL read snapshot exists — a
+        // deferred upgrade against a stale snapshot fails with
+        // SQLITE_BUSY_SNAPSHOT, which the busy wait cannot retry.
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
         // Insert nodes.
         // `ON CONFLICT DO UPDATE` instead of `INSERT OR REPLACE`:
@@ -901,7 +916,13 @@ impl StagingCorpus {
     /// UPDATE` upsert as the live corpus write path (the previous `as i64`
     /// cast could silently wrap node ids above `i64::MAX`).
     pub fn write_batch(&mut self, batch: &IngestBatch, adapter_id: &str) -> Result<()> {
-        let tx = self.conn.transaction()?;
+        // IMMEDIATE (not deferred): a write transaction must take the
+        // write lock at BEGIN, before any WAL read snapshot exists — a
+        // deferred upgrade against a stale snapshot fails with
+        // SQLITE_BUSY_SNAPSHOT, which the busy wait cannot retry.
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
         for node in &batch.nodes {
             let node_id = i64::try_from(node.id.to_raw())
@@ -1568,5 +1589,162 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_file(&live);
+    }
+
+    /// Every connection carries the bounded busy-wait, so momentary
+    /// lock contention (another process mid-transaction) delays a
+    /// writer instead of failing it instantly.
+    #[test]
+    fn busy_timeout_is_set_on_open() {
+        use std::path::PathBuf;
+
+        let dir = std::env::temp_dir().join(format!(
+            "aa-busytimeout-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let live = PathBuf::from(format!("{}.live", dir.display()));
+        let mut staging = StagingCorpus::create(&dir).expect("staging");
+        let mut b = crate::adapter::BatchBuilder::new();
+        b.add_node("one");
+        staging.write_batch(&b.build(), "test").expect("write");
+        staging.commit_to(&live).expect("commit");
+        let corpus = Corpus::open(&live).expect("open");
+
+        let timeout: i64 = corpus
+            .conn()
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .expect("busy_timeout");
+        assert_eq!(timeout, 5_000, "bounded 5 s lock wait on every connection");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&live);
+    }
+
+    /// A writer that finds the corpus locked by another connection
+    /// waits for the lock instead of failing, and completes once the
+    /// holder commits.
+    #[test]
+    fn concurrent_writer_waits_then_succeeds() {
+        use crate::adapter::BatchBuilder;
+        use std::path::PathBuf;
+        use std::time::{Duration, Instant};
+
+        let dir = std::env::temp_dir().join(format!(
+            "aa-busywait-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let live = PathBuf::from(format!("{}.live", dir.display()));
+        let mut staging = StagingCorpus::create(&dir).expect("staging");
+        let mut b = BatchBuilder::new();
+        b.add_node("one");
+        staging.write_batch(&b.build(), "test").expect("write");
+        staging.commit_to(&live).expect("commit");
+
+        // Holder: an open corpus with an explicit write lock.
+        let holder = Corpus::open(&live).expect("open holder");
+        holder
+            .conn()
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("acquire write lock");
+
+        // Contender: a second connection in another thread, trying to
+        // write while the lock is held.
+        let contender_live = live.clone();
+        let contended_at = Instant::now();
+        let handle = std::thread::spawn(move || {
+            let mut contender = Corpus::open(&contender_live).expect("open contender");
+            let mut b = BatchBuilder::with_start_id(2);
+            let n = b.add_node("from contender");
+            b.add_field(
+                n,
+                "status",
+                crate::adapter::FieldValue::Str("active".into()),
+            );
+            contender
+                .write_batch(&b.build(), "test")
+                .expect("write under lock")
+        });
+
+        // Release the lock shortly after the contender started waiting.
+        std::thread::sleep(Duration::from_millis(300));
+        holder
+            .conn()
+            .execute_batch("COMMIT")
+            .expect("release write lock");
+        handle.join().expect("contender finished");
+
+        // The contender really did wait for the lock, rather than
+        // failing fast (which is what happens without the busy wait).
+        assert!(
+            contended_at.elapsed() >= Duration::from_millis(200),
+            "contender must wait out the held lock (took {:?})",
+            contended_at.elapsed()
+        );
+
+        // And its write landed.
+        let corpus = Corpus::open(&live).expect("reopen");
+        let count: i64 = corpus
+            .conn()
+            .query_row("SELECT count(*) FROM nodes", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(count, 2, "contender's write committed");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&live);
+    }
+
+    /// Lock contention that outlasts the wait surfaces as the typed,
+    /// retryable [`CorpusError::Locked`] — not a generic sqlite error.
+    #[test]
+    fn busy_contention_classifies_as_locked() {
+        let busy = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::DatabaseBusy,
+                extended_code: 5,
+            },
+            None,
+        );
+        let locked = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::DatabaseLocked,
+                extended_code: 6,
+            },
+            None,
+        );
+        assert!(
+            matches!(
+                StorageError::from(busy),
+                StorageError::Corpus(CorpusError::Locked(_))
+            ),
+            "SQLITE_BUSY must classify as CorpusError::Locked"
+        );
+        assert!(
+            matches!(
+                StorageError::from(locked),
+                StorageError::Corpus(CorpusError::Locked(_))
+            ),
+            "SQLITE_LOCKED must classify as CorpusError::Locked"
+        );
+
+        // Unrelated sqlite failures stay generic.
+        let other = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::CannotOpen,
+                extended_code: 14,
+            },
+            None,
+        );
+        assert!(
+            matches!(StorageError::from(other), StorageError::Sqlite(_)),
+            "non-contention sqlite errors stay generic"
+        );
     }
 }

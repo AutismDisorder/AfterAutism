@@ -6,7 +6,7 @@ right items — by full-text, structured fields, or typed-edge traversal.
 
 ```toml
 [dependencies]
-afterautism = "0.0.1"
+afterautism = "0.0.2"
 ```
 
 ```rust,no_run
@@ -46,7 +46,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   Format adapters live in consuming workspaces, not in the engine.
 - **Corpus** — versioned, migratable storage (SQLite + FTS5): atomic
   staging commits, schema migrations, compressed payloads, backup and
-  restore, deterministic reads.
+  restore, deterministic reads, safe multi-process access (WAL with a
+  bounded lock wait — no configuration).
 - **Query** — one language over text + fields + graph: full-text with
   bm25 ranking, prefix, regex, `field:name op value` comparisons
   (strings, numbers, dates, booleans), `->edge_type:(...)` traversal,

@@ -68,7 +68,8 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
         if i64::from(migration.to_version) <= current {
             continue;
         }
-        let tx = conn.transaction()?;
+        // IMMEDIATE: same WAL write-transaction rule as the corpus paths.
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         tx.execute_batch(migration.sql)?;
         tx.execute(
             "INSERT INTO schema_version (version, applied) VALUES (?, strftime('%s', 'now'))",
