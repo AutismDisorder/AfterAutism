@@ -67,8 +67,11 @@ pub struct Node {
 /// types via `Adapter::edge_types`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Edge {
+    /// The source node (edge tail).
     pub from: NodeId,
+    /// The destination node (edge head).
     pub to: NodeId,
+    /// The opaque, adapter-assigned edge type.
     pub edge_type: EdgeType,
 }
 
@@ -79,11 +82,13 @@ pub struct Edge {
 pub struct EdgeType(pub String);
 
 impl EdgeType {
+    /// Build a typed edge identifier from any string-like value.
     #[must_use]
     pub fn new(name: impl Into<String>) -> Self {
         Self(name.into())
     }
 
+    /// The edge type's string form.
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0

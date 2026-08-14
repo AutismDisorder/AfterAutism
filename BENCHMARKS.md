@@ -160,6 +160,113 @@ Interpretation:
   buffered WAL design absorbs; the remaining 2.7x is the honest price
   of durability on this disk.
 
+## v0.0.2 — what changed (measured 2026-08-13)
+
+v0.0.2 is a concurrency release: it does not touch the query or read
+paths (their code is byte-identical to v0.0.1). The measurements below
+are from the same machine, identical harness (benches byte-identical
+between versions), run interleaved (A-B-A-B) to control for machine
+drift. The machine was genuinely contended during these runs
+(fsck.fat consuming one core, two browser processes, /tmp at high
+fill from leaked bench corpora) — the numbers carry a wide noise band;
+what matters is the version-to-version comparison under equal noise.
+
+**Uncontended paths — no measurable change (all within run-to-run
+noise):**
+
+| Benchmark | v0.0.1 | v0.0.2 | delta |
+|---|---|---|---|
+| full-text term | 14.3 ms | 14.7 ms | +2.8% (noise) |
+| prefix (50k hits) | 96.7 ms | 98.2 ms | +1.6% (noise) |
+| regex scan | 22.4 ms | 22.8 ms | +1.7% (noise) |
+| field equality | 51.5 ms | 49.8 ms | -3.3% (noise) |
+| field range | 44.6 ms | 45.7 ms | +2.4% (noise) |
+| boolean combo | 142.0 ms | 141.5 ms | ~0% |
+| traversal | 58.1 ms | 57.1 ms | -1.6% |
+| paged query | 50.2 ms | 52.2 ms | +4.0% (noise) |
+| vector search | 2.04 ms | 1.99 ms | -2.0% |
+| write_batch 5k | 400 ms | 406 ms | +1.5% (noise) |
+| build 5k + commit | 467/534 ms | 467/488 ms | ~0% |
+
+(An apparent +40% on build+commit in one pairing was traced to the
+environment — /tmp fill and the fsck window; a clean-slate A-B-A-B
+re-run landed all four readings inside 467-534 ms with no version
+ordering. The direct phase profile of v0.0.2 measured 402 ms total:
+create 1.9 ms + write_batch 397 ms + commit 2.3 ms + open 0.4 ms.)
+
+**Contended writes — the v0.0.2 improvement (the reason for the
+release):**
+
+Four threads × 10 batches × 100 nodes against one corpus, two runs
+each, same machine:
+
+| Metric | v0.0.1 | v0.0.2 |
+|---|---|---|
+| write failures | 3/40 and 3/40 (7.5%) | 0/40 and 0/40 |
+| nodes landed | 3701 / 4001 | 4001 / 4001 |
+| result | data missing | CLEAN |
+
+v0.0.1 randomly refuses concurrent writes (deferred transactions +
+WAL stale-snapshot upgrade failures); v0.0.2 waits out the holder and
+succeeds (IMMEDIATE write transactions + bounded busy wait). This is
+the fix the release exists for; the uncontended paths are unchanged by
+design.
+
+## v0.0.3 — indexed fields, SQL pagination, ranking (measured 2026-08-14)
+
+Same machine, same harness, **clean state** (no leaked bench corpora,
+no contention). The storage table is a separate re-run after the first
+full run exposed thermal drift (the machine throttles under a 40-minute
+bench sweep; the first run's `get_nodes` and `field_values` readings
+were 1.6x off and are discarded — the re-run below is the honest
+one). Toolchain: rustc 1.97.1, edition 2024, `bench` profile, tmpfs.
+
+**Query — the paths v0.0.3 changed:**
+
+| Benchmark | v0.0.1 | v0.0.2 | v0.0.3 | what changed |
+|---|---|---|---|---|
+| full-text term (~7.1k hits) | 13.0 ms | 14.7 ms | **6.17 ms** | SQL keyset path, no bm25 sort by default |
+| prefix (50k hits) | 93.7 ms | 98.2 ms | **27.95 ms** | same |
+| regex scan (~10k hits) | 21.5 ms | 22.8 ms | **16.15 ms** | streamed batched scan |
+| field equality (16.7k hits) | 65.9 ms | 49.8 ms | **20.01 ms** | schema-v4 indexed range scans |
+| field range (~25k hits) | 54.3 ms | 45.7 ms | **36.53 ms** | same |
+| boolean combo (3 fields) | 151 ms | 141.5 ms | **79.92 ms** | same |
+| batched traversal (~1k sources) | 58.4 ms | 57.1 ms | **4.40 ms** | id-ordered inner match |
+| paged query, limit 100 | 50.4 ms | 52.2 ms | **11.85 ms** | SQL keyset window + exact COUNT |
+| vector search top-10 | 1.38 ms | 1.99 ms | 1.45 ms | unchanged (noise) |
+
+**Storage:**
+
+| Benchmark | v0.0.1 | v0.0.3 |
+|---|---|---|
+| `write_batch` 5k nodes + 20k fields | 400 ms | **459.8 ms** |
+| `get_node` single | 7.9 µs | 9.60 µs |
+| `get_nodes` batched ×100 | 105 µs | 97.99 µs |
+| `field_values("expiry")` (50k rows) | 48.6 ms | 44.19 ms |
+| `page_nodes` limit 100 | 56.9 µs | 49.81 µs |
+| `set_payload` 160 KiB | 43.5 µs | 44.95 µs |
+| `payload` roundtrip 160 KiB | 79.2 µs | 78.93 µs |
+| size with payloads | 908 B/contract | **872 B/contract** |
+| build 5k + commit | ~467-534 ms | 491.5 ms |
+
+**The honest write-path trade.** `write_batch` is ~15% slower than
+v0.0.1: schema v4 maintains five per-kind partial value indexes, and
+each field insert updates one of them. That is the deliberate, bounded
+price of the 2-3x field-query wins above — one extra index write per
+field, regardless of how many indexes exist. Everything else on the
+write/read path is unchanged or within run-to-run noise.
+
+**Topology:**
+
+| Benchmark | v0.0.1 | v0.0.3 |
+|---|---|---|
+| `apply_filter` TextSearch (10k) | 1.32 ms | 912.7 µs |
+| `connected_components` (10k) | 5.74 ms | 3.44 ms |
+| `shortest_path` (14-hop BFS) | 2.1 µs | 1.84 µs |
+
+(Topology code is unchanged since v0.0.1; the deltas are machine-state
+noise on an uncontended re-run.)
+
 ## Rerun
 
 ```sh

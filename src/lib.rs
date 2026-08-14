@@ -31,6 +31,7 @@
 //! serving the in→out pipeline above does not belong here.
 
 #![forbid(unsafe_code)]
+#![warn(missing_docs)]
 #![warn(rust_2018_idioms)]
 #![doc = include_str!("../README.md")]
 

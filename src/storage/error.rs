@@ -17,13 +17,23 @@ pub enum CorpusHeaderError {
     /// `afterautism-storage` corpus magic. Usually signals an unrelated file
     /// mis-adopting the `.corpus` extension.
     #[error("corpus magic mismatch: expected {expected:?}, found {found:?}")]
-    WrongMagic { expected: [u8; 8], found: [u8; 8] },
+    WrongMagic {
+        /// The canonical magic the reader requires.
+        expected: [u8; 8],
+        /// What the file actually had at offset 0.
+        found: [u8; 8],
+    },
 
     /// The supplied input had fewer than `HEADER_LEN` bytes available
     /// before EOF. The header is a fixed-size prefix at the start of the
     /// corpus; a truncated prefix cannot be parsed.
     #[error("corpus header truncated: needed {needed} bytes, had {have}")]
-    Truncated { needed: usize, have: usize },
+    Truncated {
+        /// Bytes the fixed-size header requires.
+        needed: usize,
+        /// Bytes actually available before EOF.
+        have: usize,
+    },
 
     /// The file claims a higher *major* version than the parser was
     /// built against. Per / the
@@ -34,7 +44,12 @@ pub enum CorpusHeaderError {
     #[error(
         "corpus future major version unsupported: file has major={file}, reader supports up to major={supported}"
     )]
-    FutureVersion { file: u8, supported: u8 },
+    FutureVersion {
+        /// Major version the file claims.
+        file: u8,
+        /// Highest major version this reader understands.
+        supported: u8,
+    },
 }
 
 /// Errors from the corpus storage layer (`SQLite`, FTS5, atomic swap).
@@ -55,11 +70,21 @@ pub enum CorpusError {
     /// The file is not an `afterautism` corpus (`SQLite` `application_id`
     /// mismatch).
     #[error("not an afterautism corpus: application_id {found}, expected {expected}")]
-    WrongApplicationId { expected: i32, found: i32 },
+    WrongApplicationId {
+        /// The `application_id` this engine stamps.
+        expected: i32,
+        /// The foreign id found in the file.
+        found: i32,
+    },
 
     /// Schema version mismatch or unsupported schema version.
     #[error("schema version mismatch: expected {expected}, found {found}")]
-    SchemaVersion { expected: u32, found: u32 },
+    SchemaVersion {
+        /// The schema version this engine supports.
+        expected: u32,
+        /// The version found in the file.
+        found: u32,
+    },
 
     /// Atomic swap failed (staging to live).
     #[error("atomic swap failed: {0}")]
@@ -118,4 +143,5 @@ impl From<rusqlite::Error> for StorageError {
     }
 }
 
+/// Convenience result alias for storage operations.
 pub type Result<T> = std::result::Result<T, StorageError>;

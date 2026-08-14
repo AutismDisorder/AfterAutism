@@ -13,10 +13,14 @@ use thiserror::Error;
 /// Errors from the compression layer.
 #[derive(Debug, Error)]
 pub enum CompressionError {
+    /// zstd failed to compress the payload.
     #[error("zstd compress failed: {0}")]
     Compress(String),
+    /// zstd failed to decompress the payload.
     #[error("zstd decompress failed: {0}")]
     Decompress(String),
+    /// The payload marker byte is neither raw (`0x00`) nor zstd
+    /// (`0x01`).
     #[error("unknown payload marker byte: {0:#04x}")]
     UnknownMarker(u8),
     /// Decompressed payload exceeds the safety ceiling (bomb guard).

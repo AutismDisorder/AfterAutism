@@ -3,6 +3,16 @@
 
 //! Vector search: cosine similarity, a flat ANN index, and hybrid
 //! combination with text results.
+//!
+//! The index is in-memory; the corpus stores the raw vectors durably
+//! ([`crate::storage::Corpus::put_embeddings`] /
+//! [`crate::storage::Corpus::embeddings`]). Rebuild with
+//! [`VectorIndex::from_pairs`] on open, or keep it alongside the corpus
+//! for the lifetime of a session. The query language deliberately has
+//! no `near:` atom: the engine is offline by default and owns no
+//! embedding model — adapters supply vectors, and
+//! [`hybrid_combine`] fuses a vector scan with a text/kind/regex match
+//! set.
 
 use crate::core::NodeId;
 use rayon::prelude::*;
@@ -61,6 +71,7 @@ impl Embedding {
 /// One nearest-neighbour result.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VectorHit {
+    /// The matched node.
     pub node: NodeId,
     /// Cosine similarity in `[-1, 1]`.
     pub score: f32,
@@ -77,6 +88,18 @@ impl VectorIndex {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Build from stored `(node, dims)` pairs — the shape
+    /// [`crate::storage::Corpus::embeddings`] returns — so an index can
+    /// be rebuilt from a corpus after reopen or restore.
+    #[must_use]
+    pub fn from_pairs(pairs: impl IntoIterator<Item = (NodeId, Vec<f32>)>) -> Self {
+        let mut index = Self::new();
+        for (node, dims) in pairs {
+            index.insert(node, Embedding::new(dims));
+        }
+        index
     }
 
     /// Insert (or replace) the embedding for a node.
@@ -214,6 +237,19 @@ mod tests {
         let a = emb(&[1.0, 2.0]);
         let b = emb(&[1.0]);
         assert!((a.cosine_similarity(&b)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn from_pairs_rebuilds_the_corpus_shape() {
+        // The (node, dims) pair shape Corpus::embeddings returns feeds
+        // straight into a searchable index.
+        let index = VectorIndex::from_pairs(vec![
+            (NodeId::from_raw(1), vec![1.0, 0.0]),
+            (NodeId::from_raw(2), vec![0.0, 1.0]),
+        ]);
+        assert_eq!(index.len(), 2);
+        let hits = index.search(&emb(&[1.0, 0.0]), 1);
+        assert_eq!(hits[0].node, NodeId::from_raw(1));
     }
 
     #[test]

@@ -202,6 +202,9 @@ fn visit(graph: &VisibleGraph, node: NodeId, color: &mut BTreeMap<NodeId, Color>
     false
 }
 
+/// True when the graph contains at least one cycle (directed, following
+/// outgoing edges). Detected with an iterative three-color DFS: a back
+/// edge (gray neighbor) is a cycle.
 pub fn has_cycle(graph: &VisibleGraph) -> bool {
     let mut color: BTreeMap<NodeId, Color> = graph
         .visible_nodes()

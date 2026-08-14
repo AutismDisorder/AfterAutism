@@ -31,7 +31,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The right items out.
     let res = afterautism::query::query(
         &corpus,
-        "field:status = active and field:expiry > 2026-01-01",
+        "field:status = active and field:expiry >= 2026-01-01",
         &afterautism::query::ExecOptions::default(),
     )?;
     println!("matched {}", res.total.unwrap_or(0));
@@ -45,18 +45,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   the typed model (nodes, typed edges, typed fields) of any filetype.
   Format adapters live in consuming workspaces, not in the engine.
 - **Corpus** — versioned, migratable storage (SQLite + FTS5): atomic
-  staging commits, schema migrations, compressed payloads, backup and
-  restore, deterministic reads, safe multi-process access (WAL with a
-  bounded lock wait — no configuration).
+  staging commits, node deletion with full cascade, schema migrations,
+  compressed payloads, durable vector embeddings, backup and restore,
+  deterministic reads, safe multi-process access (WAL with a bounded
+  lock wait — no configuration), and checkpointing for self-contained
+  corpus files.
 - **Query** — one language over text + fields + graph: full-text with
-  bm25 ranking, prefix, regex, `field:name op value` comparisons
-  (strings, numbers, dates, booleans), `->edge_type:(...)` traversal,
-  boolean composition, keyset pagination.
+  bm25 ranking (optional rank ordering), prefix, regex,
+  `field:name op value` comparisons (strings, numbers, dates,
+  booleans — indexed range scans), `->type:(...)` / `<-type:(...)`
+  traversal with hop counts and type unions, boolean composition,
+  keyset pagination with exact totals. See [`docs/QUERY.md`](docs/QUERY.md).
 - **Topology** — typed-edge filtering as a visual transform (emphasis
   masks) and graph algorithms over the visible subgraph.
 - **Safety** — offline by default (`NetworkGate`); hard refusals on
   malformed input; decompression bomb guards; schema versions that
   cannot silently drift.
+
+## Documentation
+
+- [`docs/ENGINE.md`](docs/ENGINE.md) — what the engine objectively is:
+  concepts, use cases, a verified end-to-end walkthrough, performance,
+  guarantees, and limits.
+- [`docs/QUERY.md`](docs/QUERY.md) — the query language reference.
 
 ## License
 

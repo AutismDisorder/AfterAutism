@@ -67,7 +67,9 @@ pub enum Error {
 
     /// A plain classified error with optional context.
     Classified {
+        /// The error category.
         kind: ErrorKind,
+        /// Human-readable description.
         message: String,
         /// Attached context lines (`source=…, corpus=…`), if any.
         context: Option<String>,
@@ -167,6 +169,7 @@ impl From<ErrorKind> for Error {
     }
 }
 
+/// Convenience result alias for core operations.
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[cfg(test)]

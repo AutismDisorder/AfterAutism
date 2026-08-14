@@ -185,9 +185,23 @@ fn init_schema(conn: &mut Connection) -> Result<()> {
         )",
         [],
     )?;
+    // Vector embeddings (schema v5). Opaque little-endian f32 blobs;
+    // the engine stores them durably, adapters own their generation.
+    // Cascades on node deletion like fields and edges.
+    tx.execute(
+        "CREATE TABLE node_embeddings (
+            node_id INTEGER PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE,
+            dims    INTEGER NOT NULL CHECK (dims > 0),
+            data    BLOB NOT NULL
+        )",
+        [],
+    )?;
     // typed node fields (form-declared semantics). One row per
     // (node, field-name); the kind column tags which value column is
-    // live. The name index keeps field lookups O(fields-with-name).
+    // live. The name index keeps field lookups O(fields-with-name);
+    // the per-kind partial value indexes (schema v4) make typed-field
+    // comparisons indexed range scans per value kind instead of a
+    // full scan over every value of the field.
     tx.execute(
         "CREATE TABLE node_fields (
             node_id     INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
@@ -201,6 +215,44 @@ fn init_schema(conn: &mut Connection) -> Result<()> {
         [],
     )?;
     tx.execute("CREATE INDEX idx_node_fields_name ON node_fields(name)", [])?;
+    // Per-kind partial value indexes for `field:name op value`
+    // comparisons (schema v4): each covers exactly the rows of one
+    // kind, so the query planner can range-scan `name = ? AND kind = ?
+    // AND value_* <op> ?` directly. Equality-kind predicates are
+    // required: SQLite's planner does not use a partial index whose
+    // predicate is an `IN (...)` list. A field row lives in exactly one
+    // of these, so insert cost is one extra index per field, regardless
+    // of how many indexes exist.
+    tx.execute(
+        "CREATE INDEX idx_node_fields_cmp_int
+            ON node_fields(name, kind, value_int)
+            WHERE kind = 'int'",
+        [],
+    )?;
+    tx.execute(
+        "CREATE INDEX idx_node_fields_cmp_date
+            ON node_fields(name, kind, value_int)
+            WHERE kind = 'date'",
+        [],
+    )?;
+    tx.execute(
+        "CREATE INDEX idx_node_fields_cmp_bool
+            ON node_fields(name, kind, value_int)
+            WHERE kind = 'bool'",
+        [],
+    )?;
+    tx.execute(
+        "CREATE INDEX idx_node_fields_cmp_float
+            ON node_fields(name, kind, value_float)
+            WHERE kind = 'float'",
+        [],
+    )?;
+    tx.execute(
+        "CREATE INDEX idx_node_fields_cmp_text
+            ON node_fields(name, kind, value_text)
+            WHERE kind = 'str'",
+        [],
+    )?;
     tx.execute(
         "CREATE TABLE schema_version (
             version INTEGER PRIMARY KEY,
@@ -548,6 +600,38 @@ impl Corpus {
         Ok(out)
     }
 
+    /// Nodes whose label equals the given value (exact match).
+    /// Used by `field:value` style queries on the label.
+    pub fn nodes_by_label(&self, field: &str, value: &str) -> Result<Vec<Node>> {
+        let _ = field; // labels are the only searchable field today
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, label, kind FROM nodes WHERE label = ? ORDER BY id")?;
+        let rows = stmt.query_map(params![value], Self::node_from_row)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Id-only form of [`Corpus::nodes_by_label`] for composite query
+    /// evaluation (no label materialization).
+    pub(crate) fn node_ids_by_label(&self, value: &str) -> Result<Vec<NodeId>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM nodes WHERE label = ? ORDER BY id")?;
+        let rows = stmt.query_map(params![value], |row| row.get::<_, i64>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let id_i64 = row?;
+            let id = u64::try_from(id_i64)
+                .map_err(|_| StorageError::Corpus(CorpusError::InvalidNodeId(id_i64 as u64)))?;
+            out.push(NodeId::from_raw(id));
+        }
+        Ok(out)
+    }
+
     /// Nodes whose stored kind equals `kind` (`text` / `full_page`).
     pub fn nodes_by_kind(&self, kind: &str) -> Result<Vec<Node>> {
         let mut stmt = self
@@ -561,17 +645,19 @@ impl Corpus {
         Ok(out)
     }
 
-    /// Nodes whose label equals the given value (exact match).
-    /// Used by `field:value` style queries on the label.
-    pub fn nodes_by_label(&self, field: &str, value: &str) -> Result<Vec<Node>> {
-        let _ = field; // labels are the only searchable field today
+    /// Id-only form of [`Corpus::nodes_by_kind`] for composite query
+    /// evaluation (no label materialization).
+    pub(crate) fn node_ids_by_kind(&self, kind: &str) -> Result<Vec<NodeId>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, label, kind FROM nodes WHERE label = ? ORDER BY id")?;
-        let rows = stmt.query_map(params![value], Self::node_from_row)?;
+            .prepare("SELECT id FROM nodes WHERE kind = ? ORDER BY id")?;
+        let rows = stmt.query_map(params![kind], |row| row.get::<_, i64>(0))?;
         let mut out = Vec::new();
         for row in rows {
-            out.push(row?);
+            let id_i64 = row?;
+            let id = u64::try_from(id_i64)
+                .map_err(|_| StorageError::Corpus(CorpusError::InvalidNodeId(id_i64 as u64)))?;
+            out.push(NodeId::from_raw(id));
         }
         Ok(out)
     }
@@ -659,6 +745,44 @@ impl Corpus {
             match grouped.last_mut() {
                 Some((from, edges)) if *from == edge.from => edges.push(edge),
                 _ => grouped.push((edge.from, vec![edge])),
+            }
+        }
+        Ok(grouped)
+    }
+
+    /// Get incoming edges for a set of nodes with one query — the
+    /// symmetrical counterpart of [`Corpus::get_outgoing_edges_for`]
+    /// (same batching and grouping contract, keyed on `to_node`).
+    pub fn get_incoming_edges_for(&self, node_ids: &[NodeId]) -> Result<Vec<(NodeId, Vec<Edge>)>> {
+        if node_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = node_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let query = format!(
+            "SELECT from_node, to_node, edge_type FROM edges WHERE to_node IN ({placeholders}) ORDER BY to_node"
+        );
+        let mut stmt = self.conn.prepare(&query)?;
+        let id_values: Vec<i64> = node_ids
+            .iter()
+            .map(|id| {
+                i64::try_from(id.to_raw()).map_err(|_| {
+                    rusqlite::Error::ToSqlConversionFailure(Box::new(StorageError::Corpus(
+                        CorpusError::InvalidNodeId(id.to_raw()),
+                    )))
+                })
+            })
+            .collect::<std::result::Result<_, _>>()?;
+
+        let rows = stmt.query_map(
+            rusqlite::params_from_iter(id_values.iter()),
+            Self::edge_from_row,
+        )?;
+        let mut grouped: Vec<(NodeId, Vec<Edge>)> = Vec::new();
+        for row in rows {
+            let edge = row?;
+            match grouped.last_mut() {
+                Some((to, edges)) if *to == edge.to => edges.push(edge),
+                _ => grouped.push((edge.to, vec![edge])),
             }
         }
         Ok(grouped)
@@ -881,6 +1005,149 @@ impl Corpus {
         #[allow(clippy::cast_sign_loss)]
         Ok(count as u64)
     }
+
+    /// Remove nodes from the corpus, atomically.
+    ///
+    /// The opposite of [`Corpus::write_batch`]: incremental refreshes
+    /// converge by upserting the nodes that exist and removing the ones
+    /// that no longer do. Deletion cascades through the schema — typed
+    /// edges and fields ride `ON DELETE CASCADE`, the FTS triggers drop
+    /// the labels from the full-text index, and payloads and embeddings
+    /// are deleted explicitly in the same transaction. Returns the
+    /// number of nodes actually removed. Unknown ids are a no-op, like
+    /// a SQL `DELETE` that matches no rows.
+    pub fn remove_nodes(&mut self, node_ids: &[NodeId]) -> Result<usize> {
+        remove_nodes_in(&mut self.conn, node_ids)
+    }
+
+    /// Checkpoint the WAL so the corpus file becomes self-contained.
+    ///
+    /// The corpus lives across three sibling files while open: the
+    /// database plus `-wal` and `-shm`. To copy or move the corpus
+    /// safely, either call this first (it folds the WAL back into the
+    /// main file) or copy all three siblings together. Checkpointing is
+    /// best-effort: if another reader holds the WAL open, the write-back
+    /// is partial and this surfaces as a locked-corpus error — retry
+    /// after the other process closes.
+    pub fn checkpoint(&self) -> Result<()> {
+        // wal_checkpoint(TRUNCATE) needs to be able to write; contention
+        // with a live reader surfaces as SQLITE_BUSY/LOCKED, which the
+        // storage error model already classifies as retryable.
+        self.conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        Ok(())
+    }
+
+    /// Store (or replace) vector embeddings for nodes.
+    ///
+    /// Embeddings are dims-sized `f32` slices in little-endian byte
+    /// order; the engine stores them opaquely — adapters or the
+    /// consuming workspace own embedding generation, the corpus owns
+    /// durability. Embeddings ride `ON DELETE CASCADE`, so
+    /// [`Corpus::remove_nodes`] clears them with the node.
+    pub fn put_embeddings(&mut self, embeddings: &[(NodeId, Vec<f32>)]) -> Result<()> {
+        if embeddings.is_empty() {
+            return Ok(());
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT INTO node_embeddings (node_id, dims, data) VALUES (?, ?, ?)
+                 ON CONFLICT(node_id) DO UPDATE SET
+                    dims = excluded.dims,
+                    data = excluded.data",
+            )?;
+            for (node, dims) in embeddings {
+                if dims.is_empty() {
+                    return Err(StorageError::Corpus(CorpusError::Other(
+                        "embedding must have at least one dimension".into(),
+                    )));
+                }
+                let node_i64 = i64::try_from(node.to_raw())
+                    .map_err(|_| StorageError::Corpus(CorpusError::InvalidNodeId(node.to_raw())))?;
+                let bytes: Vec<u8> = dims.iter().flat_map(|v| v.to_le_bytes()).collect();
+                stmt.execute(params![node_i64, dims.len() as i64, bytes])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Read stored embeddings back as `(node, dims)` pairs, ordered by
+    /// node id. A row whose blob does not match its declared dimension
+    /// count is refused as corruption rather than silently misread.
+    pub fn embeddings(&self) -> Result<Vec<(NodeId, Vec<f32>)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT node_id, dims, data FROM node_embeddings ORDER BY node_id")?;
+        let rows = stmt.query_map([], |row| {
+            let id_i64: i64 = row.get(0)?;
+            let dims: i64 = row.get(1)?;
+            let data: Vec<u8> = row.get(2)?;
+            Ok((id_i64, dims, data))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id_i64, dims, data) = row?;
+            let id = u64::try_from(id_i64)
+                .map_err(|_| StorageError::Corpus(CorpusError::InvalidNodeId(id_i64 as u64)))?;
+            let dims_usize = usize::try_from(dims).map_err(|_| {
+                StorageError::Corpus(CorpusError::Other(format!(
+                    "embedding dims out of range: {dims}"
+                )))
+            })?;
+            if dims_usize == 0 || data.len() != dims_usize * std::mem::size_of::<f32>() {
+                return Err(StorageError::Corpus(CorpusError::Other(format!(
+                    "corrupt embedding: dims={dims}, bytes={}",
+                    data.len()
+                ))));
+            }
+            let mut values = Vec::with_capacity(dims_usize);
+            for chunk in data.chunks_exact(std::mem::size_of::<f32>()) {
+                values.push(f32::from_le_bytes(
+                    chunk.try_into().expect("chunk is 4 bytes"),
+                ));
+            }
+            out.push((NodeId::from_raw(id), values));
+        }
+        Ok(out)
+    }
+}
+
+/// Remove nodes from a connection, atomically, in bounded chunks (the
+/// SQLite variable limit is 999, so a huge removal list must be split).
+/// Shared by [`Corpus::remove_nodes`] and [`StagingCorpus::remove_nodes`].
+fn remove_nodes_in(conn: &mut Connection, node_ids: &[NodeId]) -> Result<usize> {
+    if node_ids.is_empty() {
+        return Ok(0);
+    }
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let mut removed = 0usize;
+    for chunk in node_ids.chunks(500) {
+        let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let ids: Vec<i64> = chunk
+            .iter()
+            .map(|id| {
+                i64::try_from(id.to_raw())
+                    .map_err(|_| StorageError::Corpus(CorpusError::InvalidNodeId(id.to_raw())))
+            })
+            .collect::<std::result::Result<_, _>>()?;
+        // Payloads have no FK (they predate the cascade pattern), so
+        // they are cleaned explicitly; edges, fields, and embeddings
+        // cascade from `nodes`.
+        tx.execute(
+            &format!("DELETE FROM node_payloads WHERE node_id IN ({placeholders})"),
+            rusqlite::params_from_iter(ids.iter()),
+        )?;
+        removed += tx.execute(
+            &format!("DELETE FROM nodes WHERE id IN ({placeholders})"),
+            rusqlite::params_from_iter(ids.iter()),
+        )?;
+    }
+    tx.commit()?;
+    Ok(removed)
 }
 
 /// Staging corpus for atomic refresh.
@@ -992,6 +1259,14 @@ impl StagingCorpus {
 
         tx.commit()?;
         Ok(())
+    }
+
+    /// Remove nodes from the staging corpus — the incremental-refresh
+    /// counterpart of [`StagingCorpus::write_batch`]. Identical cascade
+    /// semantics to [`Corpus::remove_nodes`]; takes effect on the live
+    /// corpus at the next [`StagingCorpus::commit_to`].
+    pub fn remove_nodes(&mut self, node_ids: &[NodeId]) -> Result<usize> {
+        remove_nodes_in(&mut self.conn, node_ids)
     }
 
     /// Commit staging to live corpus (atomic swap).
@@ -1138,9 +1413,21 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        // Reopening migrates v2 -> v3 in place.
+        // Reopening migrates v2 -> current in place (v3 node-fields,
+        // v4 field indexes, v5 embeddings).
         let corpus = Corpus::open(&path).unwrap();
         assert_eq!(corpus.node_count().unwrap(), 0);
+        {
+            let table: i64 = corpus
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='node_embeddings'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(table, 1, "v5 table exists after migration");
+        }
 
         // Fields are writable after migration.
         let mut b = crate::adapter::BatchBuilder::new();
@@ -1746,5 +2033,131 @@ mod tests {
             matches!(StorageError::from(other), StorageError::Sqlite(_)),
             "non-contention sqlite errors stay generic"
         );
+    }
+
+    #[test]
+    fn remove_nodes_cascades_through_every_surface() {
+        let dir = tempdir().unwrap();
+        let live = dir.path().join("del.live");
+
+        let mut staging = StagingCorpus::create(dir.path().join("del.staging")).unwrap();
+        let mut b = crate::adapter::BatchBuilder::new();
+        let keep = b.add_node("kept contract");
+        let gone = b.add_node("removed contract");
+        let child = b.add_node("child node");
+        b.add_edge(gone, child, EdgeType::new("parent"));
+        b.add_edge(keep, child, EdgeType::new("parent"));
+        b.add_field(gone, "status", FieldValue::Str("active".into()));
+        let batch = b.build();
+        staging.write_batch(&batch, "t").unwrap();
+        staging.commit_to(&live).unwrap();
+
+        let mut corpus = Corpus::open(&live).unwrap();
+        corpus.set_payload(gone, b"heavy body").unwrap();
+        corpus
+            .put_embeddings(&[(gone, vec![1.0, 0.0]), (keep, vec![0.0, 1.0])])
+            .unwrap();
+
+        let removed = corpus.remove_nodes(&[gone]).unwrap();
+        assert_eq!(removed, 1);
+
+        // Nodes, full-text, fields, edges, payloads, embeddings — all gone.
+        assert!(corpus.get_node(gone).unwrap().is_none());
+        assert!(corpus.get_node(keep).unwrap().is_some());
+        assert_eq!(corpus.search_nodes("removed", 10).unwrap().len(), 0);
+        assert!(corpus.field_values("status").unwrap().is_empty());
+        assert!(corpus.get_outgoing_edges(gone).unwrap().is_empty());
+        // The surviving edge (keep -> child) is untouched.
+        assert_eq!(corpus.get_outgoing_edges(keep).unwrap().len(), 1);
+        assert!(corpus.payload(gone).unwrap().is_none());
+        assert!(
+            corpus.payload(keep).unwrap().is_none(),
+            "no payload was set"
+        );
+        let embs = corpus.embeddings().unwrap();
+        assert_eq!(embs.len(), 1);
+        assert_eq!(embs[0].0, keep);
+        assert_eq!(corpus.node_count().unwrap(), 2);
+
+        // Unknown ids are a no-op; empty lists too.
+        assert_eq!(corpus.remove_nodes(&[]).unwrap(), 0);
+        assert_eq!(
+            corpus.remove_nodes(&[NodeId::from_raw(999)]).unwrap(),
+            0,
+            "unknown ids remove nothing"
+        );
+    }
+
+    #[test]
+    fn staging_remove_nodes_applies_on_commit() {
+        let dir = tempdir().unwrap();
+        let live = dir.path().join("staged-del.live");
+
+        let mut staging = StagingCorpus::create(dir.path().join("s.staging")).unwrap();
+        let mut b = crate::adapter::BatchBuilder::new();
+        let n = b.add_node("first");
+        staging.write_batch(&b.build(), "t").unwrap();
+        // Remove before commit; the staged corpus reflects it.
+        assert_eq!(staging.remove_nodes(&[n]).unwrap(), 1);
+        staging.commit_to(&live).unwrap();
+        let corpus = Corpus::open(&live).unwrap();
+        assert_eq!(corpus.node_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn embeddings_roundtrip_and_corruption_refusal() {
+        let dir = tempdir().unwrap();
+        let live = dir.path().join("emb.live");
+        let mut staging = StagingCorpus::create(dir.path().join("emb.staging")).unwrap();
+        let mut b = crate::adapter::BatchBuilder::new();
+        let a = b.add_node("alpha");
+        let c = b.add_node("gamma");
+        staging.write_batch(&b.build(), "t").unwrap();
+        staging.commit_to(&live).unwrap();
+        let mut corpus = Corpus::open(&live).unwrap();
+
+        corpus
+            .put_embeddings(&[(c, vec![0.0, 1.0, 0.0]), (a, vec![1.0, 0.0, 0.0])])
+            .unwrap();
+        // Read back id-ordered, values intact.
+        let embs = corpus.embeddings().unwrap();
+        assert_eq!(
+            embs,
+            vec![(a, vec![1.0, 0.0, 0.0]), (c, vec![0.0, 1.0, 0.0])]
+        );
+        // Replace converges.
+        corpus.put_embeddings(&[(a, vec![2.0, 0.0, 0.0])]).unwrap();
+        let embs = corpus.embeddings().unwrap();
+        assert_eq!(embs[0], (a, vec![2.0, 0.0, 0.0]));
+        assert_eq!(embs.len(), 2, "the other embedding survives");
+
+        // A corrupt blob (length != dims * 4) is refused, not misread.
+        corpus
+            .conn()
+            .execute(
+                "UPDATE node_embeddings SET dims = 2 WHERE node_id = ?",
+                [i64::try_from(a.to_raw()).unwrap()],
+            )
+            .unwrap();
+        assert!(corpus.embeddings().is_err());
+    }
+
+    #[test]
+    fn checkpoint_makes_corpus_self_contained() {
+        let dir = tempdir().unwrap();
+        let live = dir.path().join("cp.live");
+        let mut staging = StagingCorpus::create(dir.path().join("cp.staging")).unwrap();
+        let mut b = crate::adapter::BatchBuilder::new();
+        b.add_node("checkpointed");
+        staging.write_batch(&b.build(), "t").unwrap();
+        staging.commit_to(&live).unwrap();
+
+        let corpus = Corpus::open(&live).unwrap();
+        corpus.set_payload(NodeId::from_raw(1), b"payload").unwrap();
+        // Checkpointing while open succeeds and keeps the corpus valid.
+        corpus.checkpoint().unwrap();
+        assert_eq!(corpus.node_count().unwrap(), 1);
+        let reopened = Corpus::open(&live).unwrap();
+        assert_eq!(reopened.node_count().unwrap(), 1);
     }
 }

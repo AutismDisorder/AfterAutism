@@ -37,6 +37,15 @@ impl std::fmt::Display for FieldOp {
     }
 }
 
+/// Traversal direction over typed edges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TraverseDirection {
+    /// Follow edges from source to destination (`->`).
+    Outgoing,
+    /// Follow edges from destination to source (`<-`).
+    Incoming,
+}
+
 /// A parsed, typed query expression.
 /// The IR is deliberately small: it covers the operations the corpus
 /// actually supports (full-text, prefix, field, kind, edge traversal) and
@@ -49,14 +58,25 @@ pub enum QueryExpr {
     Text(String),
     /// Prefix match against the label.
     Prefix(String),
-    /// Label field equality (`field:value` on labels).
-    FieldEquals { field: String, value: String },
+    /// Label field equality (`field:value` on labels) — reachable only
+    /// through the typed API. The query language refuses unknown
+    /// selectors (labels carry no structured fields), reserving
+    /// `kind:`, `re:`, `prefix:`, and `text:`.
+    FieldEquals {
+        /// The selector before the colon.
+        field: String,
+        /// The value the label must equal exactly.
+        value: String,
+    },
     /// Typed-field comparison (`field:name op value`).
     /// Semantics: nodes that carry a field `name` whose value compares
     /// to `value` with `op`. Nodes without the field never match.
     FieldCmp {
+        /// The typed field's name.
         field: String,
+        /// The comparison operator.
         op: FieldOp,
+        /// The literal to compare stored values against.
         value: FieldValue,
     },
     /// Node kind match (`kind:text` / `kind:full_page`).
@@ -69,12 +89,23 @@ pub enum QueryExpr {
     Or(Box<QueryExpr>, Box<QueryExpr>),
     /// Logical negation.
     Not(Box<QueryExpr>),
-    /// Traverse from matched nodes along an edge type (`->type:`).
-    /// Semantics: nodes reachable from the inner match in one hop along
-    /// edges of the given type.
+    /// Traverse from matched nodes along typed edges (`->type:(...)`,
+    /// `<-type:(...)`, with an optional depth `->type:N:(...)` and an
+    /// optional type union `->(a|b):(...)`).
+    /// Semantics: the set of nodes reachable from the inner match in at
+    /// most `depth` hops (each hop following an edge whose type is in
+    /// `edge_types`, in the given direction). The starting match set
+    /// itself is not part of the result. Depth 1 is the single-hop
+    /// traversal of earlier versions.
     Traverse {
+        /// The match set to traverse out of.
         inner: Box<QueryExpr>,
-        edge_type: String,
+        /// Which way to follow the edges.
+        direction: TraverseDirection,
+        /// The edge types to follow (at least one).
+        edge_types: Vec<String>,
+        /// Maximum number of hops (at least 1).
+        depth: usize,
     },
 }
 
@@ -110,8 +141,27 @@ impl QueryExpr {
             Self::And(a, b) => format!("({} and {})", a.display(), b.display()),
             Self::Or(a, b) => format!("({} or {})", a.display(), b.display()),
             Self::Not(a) => format!("not {}", a.display()),
-            Self::Traverse { inner, edge_type } => {
-                format!("({} ->{edge_type}:)", inner.display())
+            Self::Traverse {
+                inner,
+                direction,
+                edge_types,
+                depth,
+            } => {
+                let arrow = match direction {
+                    TraverseDirection::Outgoing => "->",
+                    TraverseDirection::Incoming => "<-",
+                };
+                let types = if edge_types.len() == 1 {
+                    edge_types[0].clone()
+                } else {
+                    format!("({})", edge_types.join("|"))
+                };
+                let hops = if *depth == 1 {
+                    String::new()
+                } else {
+                    format!("{depth}:")
+                };
+                format!("{arrow}{types}:{hops}({})", inner.display())
             }
         }
     }
@@ -122,10 +172,23 @@ impl QueryExpr {
 pub struct QueryResult {
     /// Matching node ids in deterministic order.
     pub node_ids: Vec<crate::core::NodeId>,
-    /// Total matches before pagination (when known).
+    /// Total matches before pagination (when known). Always known for
+    /// the query language: computed exactly, never from a truncated
+    /// result set.
     pub total: Option<u64>,
-    /// Keyset cursor: pass back as `after` on the next page.
+    /// Keyset cursor: pass back as `after` on the next page (id-ordered
+    /// results).
     pub next_after: Option<crate::core::NodeId>,
+    /// Rank cursor for rank-ordered results: pass back as `after_rank`
+    /// together with `next_after` on the next page. `None` unless the
+    /// query was executed with
+    /// [`crate::query::exec::ResultOrder::ByRank`] over a full-text or
+    /// prefix atom.
+    pub next_after_rank: Option<f64>,
+    /// bm25 rank per returned node (lower = better), aligned with
+    /// `node_ids`. `Some` only for rank-ordered full-text / prefix
+    /// queries; `None` otherwise.
+    pub ranks: Option<Vec<f64>>,
 }
 
 impl QueryResult {
@@ -147,7 +210,23 @@ mod tests {
     #[test]
     fn display_roundtrip_readable() {
         let e = QueryExpr::parse("alice and kind:text").expect("parse");
-        assert_eq!(e.display(), "(text:alice and kind:text)");
+        let rendered = e.display();
+        assert_eq!(rendered, "(text:alice and kind:text)");
+        // The canonical render parses back to the same expression.
+        assert_eq!(QueryExpr::parse(&rendered).expect("re-parse"), e);
+    }
+
+    #[test]
+    fn traverse_display_roundtrips() {
+        for text in [
+            "->parent:(alice)",
+            "<-parent:(alice)",
+            "->a:3:(alice)",
+            "<-(a|b):2:(alice)",
+        ] {
+            let e = QueryExpr::parse(text).expect("parse");
+            assert_eq!(QueryExpr::parse(&e.display()).expect("re-parse"), e);
+        }
     }
 
     #[test]

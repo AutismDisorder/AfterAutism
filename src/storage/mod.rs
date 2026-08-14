@@ -23,6 +23,15 @@
 //! - The live corpus file carries the newest transactions once the WAL
 //!   is folded in (a commit checkpoints it); before then, a bare copy
 //!   of the file may miss recent writes.
+//! - To copy or move a corpus file safely, call
+//!   [`corpus::Corpus::checkpoint`] first (folds the WAL into the main
+//!   file), or copy the `-wal` and `-shm` siblings together with it.
+//!
+//! # Determinism note
+//!
+//! Reads are deterministic. The `created` / `updated` timestamps
+//! stamped by writes are wall-clock values, informational only — they
+//! are not part of the read contract.
 
 pub mod compression;
 pub mod corpus;

@@ -10,8 +10,11 @@ use std::collections::{HashMap, HashSet};
 /// A directed typed edge between two visible nodes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypedEdge {
+    /// The source node (edge tail).
     pub from: NodeId,
+    /// The destination node (edge head).
     pub to: NodeId,
+    /// The edge's type (opaque, adapter-assigned).
     pub edge_type: EdgeType,
 }
 

@@ -57,39 +57,43 @@ impl NetworkPolicy {
 /// `"static.crates.io"`. This is an *additional* allowance, never a
 /// backdoor: when the global policy is `Online`, the allowlist is
 /// irrelevant.
+/// Each entry stores its two comparison forms (exact and dotted suffix)
+/// at `allow` time, so per-check matching is allocation-free.
 #[derive(Debug, Clone, Default)]
 pub struct DomainPolicy {
-    allowed_suffixes: ArcFlagVec,
+    allowed: ArcDomainEntries,
 }
 
 impl DomainPolicy {
     /// Allow egress to `host` (suffix match) even while globally offline.
     pub fn allow(&self, host: impl Into<String>) {
-        self.allowed_suffixes.push(host.into());
+        let host = host.into();
+        let suffix = format!(".{host}");
+        self.allowed.push((host, suffix));
     }
 
     /// True when `host` matches an allowed suffix.
     #[must_use]
     pub fn permits(&self, host: &str) -> bool {
-        self.allowed_suffixes
+        self.allowed
             .iter()
-            .any(|allowed| host == allowed || host.ends_with(&format!(".{allowed}")))
+            .any(|(exact, suffix)| host == exact || host.ends_with(suffix.as_str()))
     }
 }
 
-/// A shared, append-only list of strings.
+/// A shared, append-only list of `(exact, dotted-suffix)` domain pairs.
 #[derive(Debug, Clone, Default)]
-struct ArcFlagVec {
-    inner: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+struct ArcDomainEntries {
+    inner: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
 }
 
-impl ArcFlagVec {
-    fn push(&self, value: String) {
+impl ArcDomainEntries {
+    fn push(&self, value: (String, String)) {
         self.inner.lock().unwrap().push(value);
     }
-    fn iter(&self) -> impl Iterator<Item = String> + '_ {
+    fn iter(&self) -> impl Iterator<Item = (String, String)> + '_ {
         let guard = self.inner.lock().unwrap();
-        guard.iter().cloned().collect::<Vec<_>>().into_iter()
+        guard.clone().into_iter()
     }
 }
 

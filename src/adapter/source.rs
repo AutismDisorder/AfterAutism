@@ -12,7 +12,10 @@ use serde::{Deserialize, Serialize};
 /// source is unchanged — no body, no strip, no storage write.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceMeta {
+    /// Entity-tag for conditional requests (`If-None-Match`).
     pub etag: Option<String>,
+    /// Last-modification timestamp for conditional requests
+    /// (`If-Modified-Since`).
     pub last_modified: Option<String>,
 }
 
@@ -25,11 +28,15 @@ pub struct SourceMeta {
 /// identity + metadata, not a lossy `&str` payload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Source {
+    /// Stable identifier (URL, file path, record id) — what the adapter
+    /// resolves content from.
     pub key: String,
+    /// Conditional-request metadata persisted between refresh cycles.
     pub meta: SourceMeta,
 }
 
 impl Source {
+    /// A source with fresh (empty) metadata.
     #[must_use]
     pub fn new(key: impl Into<String>) -> Self {
         Self {

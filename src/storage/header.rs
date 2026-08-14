@@ -294,6 +294,36 @@ mod tests {
     }
 
     #[test]
+    fn every_truncation_length_is_refused_cleanly() {
+        let mut buf = Vec::new();
+        CorpusHeader::new_v1(0, 1).write_into(&mut buf).unwrap();
+        for cut in 0..buf.len() {
+            let mut cur = std::io::Cursor::new(&buf[..cut]);
+            assert!(
+                CorpusHeader::read_from(&mut cur).is_err(),
+                "truncation at {cut} bytes must be a typed error"
+            );
+        }
+    }
+
+    #[test]
+    fn single_bit_flips_never_panic() {
+        // Flip every bit of every header byte: the reader must return a
+        // typed error or a parsed header — never panic, never silently
+        // accept garbage (a flipped magic/major byte must refuse).
+        let mut buf = Vec::new();
+        CorpusHeader::new_v1(0, 1).write_into(&mut buf).unwrap();
+        for byte in 0..buf.len() {
+            for bit in 0..8 {
+                let mut mutated = buf.clone();
+                mutated[byte] ^= 1 << bit;
+                let mut cur = std::io::Cursor::new(&mutated);
+                let _ = CorpusHeader::read_from(&mut cur);
+            }
+        }
+    }
+
+    #[test]
     fn new_v1_pins_major_to_supported_constant() {
         // The constructor hard-pins v1.x for v1 writers; the type stays
         // closed under `major == SUPPORTED_MAJOR`. A future v2 writer

@@ -9,6 +9,8 @@ pub use crate::adapter::{
     Source, SourceMeta,
 };
 pub use crate::core::{AdapterId, NetworkGate, NetworkPolicy, NodeId};
+pub use crate::query::exec::{ExecOptions, ResultOrder};
+pub use crate::query::ir::TraverseDirection;
 pub use crate::query::{QueryExpr, QueryResult};
 pub use crate::storage::{Corpus, StagingCorpus};
 pub use crate::topology::VisibleGraph;

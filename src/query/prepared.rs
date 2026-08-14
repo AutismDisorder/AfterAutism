@@ -138,9 +138,28 @@ fn collect_plan(expr: &QueryExpr, plan: &mut Vec<PlanStep>) {
             collect_plan(a, plan);
             plan.push(PlanStep::Difference);
         }
-        QueryExpr::Traverse { inner, edge_type } => {
+        QueryExpr::Traverse {
+            inner,
+            direction,
+            edge_types,
+            depth,
+        } => {
             collect_plan(inner, plan);
-            plan.push(PlanStep::EdgeTraversal(edge_type.clone()));
+            let arrow = match direction {
+                crate::query::ir::TraverseDirection::Outgoing => "->",
+                crate::query::ir::TraverseDirection::Incoming => "<-",
+            };
+            let types = if edge_types.len() == 1 {
+                edge_types[0].clone()
+            } else {
+                format!("({})", edge_types.join("|"))
+            };
+            let spec = if *depth == 1 {
+                format!("{arrow}{types}:")
+            } else {
+                format!("{arrow}{types}:{depth}:")
+            };
+            plan.push(PlanStep::EdgeTraversal(spec));
         }
     }
 }
@@ -192,7 +211,7 @@ mod tests {
         collect_plan(p.expr(), &mut plan);
         assert!(plan.contains(&PlanStep::FtsLookup));
         assert!(plan.contains(&PlanStep::Union));
-        assert!(plan.contains(&PlanStep::EdgeTraversal("parent".into())));
+        assert!(plan.contains(&PlanStep::EdgeTraversal("->parent:".into())));
     }
 
     #[test]

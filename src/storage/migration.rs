@@ -22,8 +22,11 @@ pub struct Migration {
 
 /// The migrations the engine knows about, in application order:
 /// schema v2 added the unique edge index; schema v3 added the typed
-/// node-fields table. The table is authoritative: appending a migration
-/// bumps [`SCHEMA_VERSION`] and adds an entry here.
+/// node-fields table; schema v4 added per-kind partial value indexes so
+/// typed field comparisons are indexed range scans; schema v5 added the
+/// durable vector-embedding table. The table is authoritative:
+/// appending a migration bumps [`SCHEMA_VERSION`] and adds an entry
+/// here.
 pub fn migrations() -> Vec<Migration> {
     vec![
         Migration {
@@ -46,11 +49,39 @@ pub fn migrations() -> Vec<Migration> {
                   );
                   CREATE INDEX IF NOT EXISTS idx_node_fields_name ON node_fields(name)",
         },
+        Migration {
+            to_version: 4,
+            name: "v4: per-kind partial value indexes for typed-field comparisons",
+            sql: "CREATE INDEX IF NOT EXISTS idx_node_fields_cmp_int
+                    ON node_fields(name, kind, value_int)
+                    WHERE kind = 'int';
+                  CREATE INDEX IF NOT EXISTS idx_node_fields_cmp_date
+                    ON node_fields(name, kind, value_int)
+                    WHERE kind = 'date';
+                  CREATE INDEX IF NOT EXISTS idx_node_fields_cmp_bool
+                    ON node_fields(name, kind, value_int)
+                    WHERE kind = 'bool';
+                  CREATE INDEX IF NOT EXISTS idx_node_fields_cmp_float
+                    ON node_fields(name, kind, value_float)
+                    WHERE kind = 'float';
+                  CREATE INDEX IF NOT EXISTS idx_node_fields_cmp_text
+                    ON node_fields(name, kind, value_text)
+                    WHERE kind = 'str'",
+        },
+        Migration {
+            to_version: 5,
+            name: "v5: durable vector embeddings",
+            sql: "CREATE TABLE IF NOT EXISTS node_embeddings (
+                    node_id INTEGER PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE,
+                    dims    INTEGER NOT NULL CHECK (dims > 0),
+                    data    BLOB NOT NULL
+                  )",
+        },
     ]
 }
 
 /// Current schema version after all known migrations.
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// Apply all pending migrations to `conn`.
 /// Idempotent: applied versions are read from `schema_version` first.
@@ -126,11 +157,37 @@ mod tests {
             )
             .expect("table check");
         assert_eq!(table_count, 1);
-        // And schema_version records v3.
+        // And the v4 per-kind partial value indexes exist.
+        for name in [
+            "idx_node_fields_cmp_int",
+            "idx_node_fields_cmp_date",
+            "idx_node_fields_cmp_bool",
+            "idx_node_fields_cmp_float",
+            "idx_node_fields_cmp_text",
+        ] {
+            let idx_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?1",
+                    [name],
+                    |r| r.get(0),
+                )
+                .expect("index check");
+            assert_eq!(idx_count, 1, "{name} should exist after migration");
+        }
+        // And schema_version records v5.
         let v: i64 = conn
             .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
             .expect("version");
-        assert_eq!(v, 3);
+        assert_eq!(v, 5);
+        // And the v5 embeddings table exists.
+        let table_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='node_embeddings'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("table check");
+        assert_eq!(table_count, 1);
     }
 
     #[test]
@@ -141,7 +198,7 @@ mod tests {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM schema_version", [], |r| r.get(0))
             .expect("count");
-        assert_eq!(count, 3, "v1 fixture + v2 + v3 applied exactly once");
+        assert_eq!(count, 5, "v1 fixture + v2..v5 applied exactly once");
     }
 
     #[test]

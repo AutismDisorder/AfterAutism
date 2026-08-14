@@ -11,11 +11,6 @@ use crate::core::AdapterId;
 
 /// What an adapter is. Trait object friendly: the runtime holds a
 /// `Box<dyn Adapter>` and dispatches per-adapter ingest.
-/// The trait is intentionally *minimal*. The ingest pipeline handler
-/// invokes `ingest()`; the topology engine reads `edge_types()` to
-/// interpret adapter-supplied typed edges generically. The adapter does
-/// not own rendering, filtering, or storage; it only knows about its
-/// own data type.
 /// The current adapter ABI version.
 /// Plugin hosts check the `afterautism_adapter_abi_version` symbol
 /// (exported by `afterautism-adapter`) against this constant at bind time
@@ -83,6 +78,13 @@ impl AdapterCapabilities {
     }
 }
 
+/// What an adapter is. Trait object friendly: the runtime holds a
+/// `Box<dyn Adapter>` and dispatches per-adapter ingest.
+/// The trait is intentionally *minimal*. The ingest pipeline handler
+/// invokes `ingest()`; the topology engine reads `edge_types()` to
+/// interpret adapter-supplied typed edges generically. The adapter does
+/// not own rendering, filtering, or storage; it only knows about its
+/// own data type.
 pub trait Adapter: Send + Sync {
     /// Adapter's stable identifier. Two adapters in the same runtime
     /// must not collide.
@@ -146,13 +148,16 @@ pub trait Adapter: Send + Sync {
 /// apply atomic swaps per / .
 #[derive(Debug, Clone, Default)]
 pub struct IngestBatch {
+    /// The nodes the adapter produced.
     pub nodes: Vec<Node>,
+    /// The typed edges the adapter produced.
     pub edges: Vec<Edge>,
     /// Typed fields attached to nodes (form-declared semantics).
     pub fields: Vec<NodeField>,
 }
 
 impl IngestBatch {
+    /// A fresh, empty batch.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
