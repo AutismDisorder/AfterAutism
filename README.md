@@ -6,7 +6,7 @@ right items — by full-text, structured fields, or typed-edge traversal.
 
 ```toml
 [dependencies]
-afterautism = "0.0.2"
+afterautism = "0.0.3"
 ```
 
 ```rust,no_run
